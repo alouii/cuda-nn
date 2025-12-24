@@ -26,7 +26,7 @@ def summarize_and_plot(csv_path: Path, out_dir: Path, show: bool = True, top_n=N
 	if not csv_path.exists():
 		raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-	df = pd.read_csv(csv_path)
+	df = pd.read_csv(csv_path, comment='#')
 	if 'Epoch' in df.columns:
 		df = df.set_index('Epoch')
 

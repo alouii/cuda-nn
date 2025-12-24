@@ -24,7 +24,22 @@ inline void cudaAssert(cudaError_t e, const char* f, int l) {
     } \
 } while(0)
 
-int main() {
+int main(int argc, char** argv) {
+
+    // parse simple CLI flags
+    int epochs_flag = 50;
+    bool use_fused = false;
+    bool use_pinned = false;
+    bool cpu_only = false;
+    bool gpu_only = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--fused") use_fused = true;
+        else if (a == "--pinned") use_pinned = true;
+        else if (a == "--cpu-only") cpu_only = true;
+        else if (a == "--gpu-only") gpu_only = true;
+        else if (a == "--epochs" && i + 1 < __argc) { epochs_flag = std::stoi(__argv[++i]); }
+    }
 
     const int N = 8192; // dataset size
     const int D = 2;
@@ -33,12 +48,21 @@ int main() {
     const float lr = 0.01f;
 
     std::vector<float> h_X(N*D), h_y(N);
+    float *pinned_X = nullptr, *pinned_y = nullptr;
     std::mt19937 gen(0);
     std::uniform_real_distribution<float> dist(0,1);
     for(int i=0;i<N;i++){
         h_X[i*D] = dist(gen);
         h_X[i*D+1] = dist(gen);
         h_y[i] = h_X[i*D]+h_X[i*D+1];
+    }
+
+    if (use_pinned) {
+        // allocate pinned host memory and copy data
+        CHECK(cudaHostAlloc((void**)&pinned_X, N*D*sizeof(float), cudaHostAllocDefault));
+        CHECK(cudaHostAlloc((void**)&pinned_y, N*sizeof(float), cudaHostAllocDefault));
+        memcpy(pinned_X, h_X.data(), N*D*sizeof(float));
+        memcpy(pinned_y, h_y.data(), N*sizeof(float));
     }
 
     float *X, *y, *W1, *b1, *Z1, *W2, *b2, *Z2;
@@ -57,8 +81,14 @@ int main() {
     CHECK(cudaMalloc(&dW1, D*H*sizeof(float)));
     CHECK(cudaMalloc(&dW2, H*O*sizeof(float)));
 
-    CHECK(cudaMemcpy(X, h_X.data(), N*D*sizeof(float), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(y, h_y.data(), N*sizeof(float), cudaMemcpyHostToDevice));
+    // copy inputs (use pinned pointers if requested)
+    if (use_pinned) {
+        CHECK(cudaMemcpy(X, pinned_X, N*D*sizeof(float), cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(y, pinned_y, N*sizeof(float), cudaMemcpyHostToDevice));
+    } else {
+        CHECK(cudaMemcpy(X, h_X.data(), N*D*sizeof(float), cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(y, h_y.data(), N*sizeof(float), cudaMemcpyHostToDevice));
+    }
 
     // initialize weights and biases on host and copy to device
     std::vector<float> h_W1(D*H), h_b1(H), h_W2(H*O), h_b2(O);
@@ -114,8 +144,10 @@ int main() {
     // Warm up CPU (cache)
     cpu_matmul(h_X.data(), h_W1.data(), h_Z1.data(), N, H, D);
 
-    const int epochs=50;
+    const int epochs=epochs_flag;
     std::ofstream log("kernel_times.csv");
+    // write config as commented line so plotting scripts can ignore it
+    log << "# config: fused=" << (use_fused?1:0) << ",pinned=" << (use_pinned?1:0) << ",cpu_only=" << (cpu_only?1:0) << ",gpu_only=" << (gpu_only?1:0) << ",epochs=" << epochs << "\n";
     log << "Epoch,matmul1,bias1,relu1,matmul2,bias2,mse,dW2,dZ1,relu_b,dW1,sgd1,sgd2,mse_value,cpu_mse_value,";
     log << "cpu_matmul1,cpu_bias1,cpu_relu1,cpu_matmul2,cpu_bias2,cpu_mse,cpu_dW2,cpu_dZ1,cpu_relu_b,cpu_dW1,cpu_sgd1,cpu_sgd2\n";
 
@@ -124,6 +156,13 @@ int main() {
 
     for(int epoch=0;epoch<epochs;epoch++){
         // --- CPU baseline timings ---
+        if (gpu_only) {
+            // skip CPU baseline when GPU-only mode requested
+            cpu_t_matmul1 = cpu_t_bias1 = cpu_t_relu1 = cpu_t_matmul2 = cpu_t_bias2 = cpu_t_mse = 0.0;
+            cpu_t_matmul_dW2 = cpu_t_matmul_dZ1 = cpu_t_relu_b = cpu_t_matmul_dW1 = cpu_t_sgd1 = cpu_t_sgd2 = 0.0;
+            // set cpu mse to -1 to indicate skipped
+            float cpu_mse_value = -1.0f;
+        } else {
         double cpu_t_matmul1=0, cpu_t_bias1=0, cpu_t_relu1=0, cpu_t_matmul2=0, cpu_t_bias2=0, cpu_t_mse=0;
         double cpu_t_matmul_dW2=0, cpu_t_matmul_dZ1=0, cpu_t_relu_b=0, cpu_t_matmul_dW1=0, cpu_t_sgd1=0, cpu_t_sgd2=0;
 
@@ -187,22 +226,37 @@ int main() {
         auto tc22 = std::chrono::high_resolution_clock::now();
         cpu_sgd_update(h_W2.data(), h_dW2.data(), lr, H*O);
         auto tc23 = std::chrono::high_resolution_clock::now(); cpu_t_sgd2 = std::chrono::duration<double,std::milli>(tc23-tc22).count();
-        // Forward layer1
+        }
+        // Forward layer1 (GPU)
+        if (cpu_only) {
+            // skip GPU work
+            t_matmul1 = t_bias1 = t_relu1 = t_matmul2 = t_bias2 = t_mse = 0.0f;
+            float gpu_mse_value = -1.0f;
+        } else {
         CHECK(cudaEventRecord(start));
         matmul<<<gridZ1, block2D>>>(X, W1, Z1, N, H, D);
         CHECK_KERNEL();
         CHECK(cudaEventRecord(stop)); CHECK(cudaEventSynchronize(stop));
         CHECK(cudaEventElapsedTime(&t_matmul1,start,stop));
 
-        CHECK(cudaEventRecord(start));
-        add_bias<<<(N*H+255)/256,256>>>(Z1,b1,N,H);
-        CHECK(cudaEventRecord(stop)); CHECK(cudaEventSynchronize(stop));
-        CHECK(cudaEventElapsedTime(&t_bias1,start,stop));
+        if (use_fused) {
+            CHECK(cudaEventRecord(start));
+            add_bias_relu<<<(N*H+255)/256,256>>>(Z1,b1,N,H);
+            CHECK_KERNEL();
+            CHECK(cudaEventRecord(stop)); CHECK(cudaEventSynchronize(stop));
+            CHECK(cudaEventElapsedTime(&t_bias1,start,stop));
+            t_relu1 = 0.0f; // fused
+        } else {
+            CHECK(cudaEventRecord(start));
+            add_bias<<<(N*H+255)/256,256>>>(Z1,b1,N,H);
+            CHECK(cudaEventRecord(stop)); CHECK(cudaEventSynchronize(stop));
+            CHECK(cudaEventElapsedTime(&t_bias1,start,stop));
 
-        CHECK(cudaEventRecord(start));
-        relu<<<(N*H+255)/256,256>>>(Z1,N*H);
-        CHECK(cudaEventRecord(stop)); CHECK(cudaEventSynchronize(stop));
-        CHECK(cudaEventElapsedTime(&t_relu1,start,stop));
+            CHECK(cudaEventRecord(start));
+            relu<<<(N*H+255)/256,256>>>(Z1,N*H);
+            CHECK(cudaEventRecord(stop)); CHECK(cudaEventSynchronize(stop));
+            CHECK(cudaEventElapsedTime(&t_relu1,start,stop));
+        }
 
         // Forward layer2
         CHECK(cudaEventRecord(start));
@@ -221,14 +275,15 @@ int main() {
         CHECK(cudaEventRecord(stop)); CHECK(cudaEventSynchronize(stop));
         CHECK(cudaEventElapsedTime(&t_mse,start,stop));
 
-        // copy GPU predictions back to host and compute MSE value for logging
-        CHECK(cudaMemcpy(h_Z2_gpu.data(), Z2, N*O*sizeof(float), cudaMemcpyDeviceToHost));
-        float gpu_mse_value = 0.0f;
-        for (int i = 0; i < N; ++i) {
-            float diff = h_Z2_gpu[i*O + 0] - h_y[i];
-            gpu_mse_value += diff * diff;
+            // copy GPU predictions back to host and compute MSE value for logging
+            CHECK(cudaMemcpy(h_Z2_gpu.data(), Z2, N*O*sizeof(float), cudaMemcpyDeviceToHost));
+            float gpu_mse_value = 0.0f;
+            for (int i = 0; i < N; ++i) {
+                float diff = h_Z2_gpu[i*O + 0] - h_y[i];
+                gpu_mse_value += diff * diff;
+            }
+            gpu_mse_value /= N;
         }
-        gpu_mse_value /= N;
 
         // Backpropagation
         CHECK(cudaEventRecord(start));
@@ -272,6 +327,7 @@ int main() {
             << t_matmul2 << "," << t_bias2 << "," << t_mse << ","
             << t_matmul_dW2 << "," << t_matmul_dZ1 << "," << t_relu_b << ","
             << t_matmul_dW1 << "," << t_sgd1 << "," << t_sgd2 << ","
+            // write MSE values (may be -1 if skipped)
             << gpu_mse_value << "," << cpu_mse_value << ","
             << cpu_t_matmul1 << "," << cpu_t_bias1 << "," << cpu_t_relu1 << ","
             << cpu_t_matmul2 << "," << cpu_t_bias2 << "," << cpu_t_mse << ","

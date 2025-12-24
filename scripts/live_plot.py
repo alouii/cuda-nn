@@ -29,7 +29,7 @@ def parse_args():
 
 def safe_read_csv(csv: Path):
     try:
-        return pd.read_csv(csv)
+        return pd.read_csv(csv, comment='#')
     except Exception:
         return None
 
