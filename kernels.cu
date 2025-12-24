@@ -96,16 +96,74 @@ __global__ void matmul_tiled(const float* A, const float* B, float* C, int M, in
 
 // C = A^T * B where A is K x M (stored row-major), B is K x N -> C is M x N
 __global__ void matmul_at_b(const float* A, const float* B, float* C, int M, int N, int K) {
-    // A: K x M, B: K x N -> want C = A^T * B (M x N)
-    // Use tiled kernel with transA = true, transB = false
-    matmul_tiled(A, B, C, M, N, K, /*transA=*/true, /*transB=*/false);
+    // Tiled implementation specialized for A: K x M, B: K x N -> C = A^T * B (M x N)
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    float sum = 0.0f;
+    __shared__ float sA[TILE][TILE];
+    __shared__ float sB[TILE][TILE];
+
+    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
+        int a_k = t * TILE + threadIdx.x;
+        int a_m = row;
+        if (a_k < K && a_m < M)
+            sA[threadIdx.y][threadIdx.x] = A[a_k * M + a_m]; // A[k][m]
+        else
+            sA[threadIdx.y][threadIdx.x] = 0.0f;
+
+        int b_k = t * TILE + threadIdx.y;
+        int b_n = col;
+        if (b_k < K && b_n < N)
+            sB[threadIdx.y][threadIdx.x] = B[b_k * N + b_n]; // B[k][n]
+        else
+            sB[threadIdx.y][threadIdx.x] = 0.0f;
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE; ++k)
+            sum += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
 }
 
 // C = A * B^T where A is M x K, B is N x K -> C is M x N
 __global__ void matmul_bt(const float* A, const float* B, float* C, int M, int N, int K) {
-    // A: M x K, B: N x K -> want C = A * B^T (M x N)
-    // Use tiled kernel with transA = false, transB = true
-    matmul_tiled(A, B, C, M, N, K, /*transA=*/false, /*transB=*/true);
+    // Tiled implementation specialized for A: M x K, B: N x K -> C = A * B^T (M x N)
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    float sum = 0.0f;
+    __shared__ float sA[TILE][TILE];
+    __shared__ float sB[TILE][TILE];
+
+    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
+        int Arow = row;
+        int Acol = t * TILE + threadIdx.x;
+        if (Arow < M && Acol < K)
+            sA[threadIdx.y][threadIdx.x] = A[Arow * K + Acol];
+        else
+            sA[threadIdx.y][threadIdx.x] = 0.0f;
+
+        int Brow = t * TILE + threadIdx.y;
+        int Bcol = col;
+        if (Bcol < N && Brow < K)
+            sB[threadIdx.y][threadIdx.x] = B[Bcol * K + Brow]; // B[col][k]
+        else
+            sB[threadIdx.y][threadIdx.x] = 0.0f;
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE; ++k)
+            sum += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
 }
 
 // Add bias
