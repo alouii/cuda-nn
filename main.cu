@@ -349,5 +349,10 @@ int main(int argc, char** argv) {
     cudaFree(W2); cudaFree(b2); cudaFree(Z2);
     cudaFree(dZ2); cudaFree(dZ1); cudaFree(dW1); cudaFree(dW2);
 
+    if (use_pinned) {
+        cudaFreeHost(pinned_X);
+        cudaFreeHost(pinned_y);
+    }
+
     return 0;
 }
